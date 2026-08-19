@@ -242,7 +242,7 @@ func (c *CFSecrets) loadConfig() (SecretsConfig, error) {
 	if err != nil {
 		return SecretsConfig{}, fmt.Errorf("cf_secrets: %w", err)
 	}
-	return *loaded, nil
+	return loaded, nil
 }
 
 func (c *CFSecrets) rebuildDriversLocked(ctx context.Context) error {
