@@ -7,7 +7,10 @@ import "fmt"
 //
 // Path meanings by kind:
 //
-//   - vault / openbao: KV path under kv_mount (e.g. "caerus-framework/release-train-gh-app")
+//   - vault / openbao: CLI-style KV path under kv_mount (e.g.
+//     "caerus-framework/release-train-gh-app"). Same as `vault kv get
+//     <mount>/<path>`. Do not include the KV v2 HTTP prefix "data/" — the
+//     driver inserts /v1/<mount>/data/. KV v1 (no /data/) is not supported.
 //   - aws: Secrets Manager name or ARN
 //   - gcp: secret id (short name, or full "projects/…/secrets/…" resource)
 //   - file: path relative to the provider root

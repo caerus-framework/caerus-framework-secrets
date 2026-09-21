@@ -2,6 +2,8 @@ package cf_secrets
 
 import (
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -56,8 +58,13 @@ type ProviderConfig struct {
 	K8sJWTPath string `json:"k8s_jwt_path,omitempty" yaml:"k8s_jwt_path,omitempty"`
 	// TLSCAFile is an optional PEM CA for Vault/OpenBao HTTPS.
 	TLSCAFile string `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty"`
-	// TLSInsecureSkipVerify skips TLS verify (lab only).
+	// TLSInsecureSkipVerify skips TLS verify (lab only). Error-log + metric
+	// when on. Never production.
 	TLSInsecureSkipVerify *bool `json:"tls_insecure_skip_verify,omitempty" yaml:"tls_insecure_skip_verify,omitempty"`
+	// AllowInsecureHTTP allows http:// address (httptest / laptop). Default
+	// off: address must be https://. Not the same as TLSInsecureSkipVerify
+	// (that is HTTPS without cert verify). Lab only. Error-log + metric.
+	AllowInsecureHTTP *bool `json:"allow_insecure_http,omitempty" yaml:"allow_insecure_http,omitempty"`
 
 	// Region is the AWS region (required for kind aws).
 	Region string `json:"region,omitempty" yaml:"region,omitempty"`
@@ -90,6 +97,8 @@ const (
 	defaultTimeout  = 10.0
 )
 
+var mountNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 func normalizeKind(kind string) (string, error) {
 	k := strings.ToLower(strings.TrimSpace(kind))
 	switch k {
@@ -112,8 +121,16 @@ func validateProvider(name string, p ProviderConfig) error {
 	}
 	switch kind {
 	case kindVault, kindOpenBao:
-		if strings.TrimSpace(p.Address) == "" {
-			return fmt.Errorf("provider %q: address is required for kind %s", name, kind)
+		if err := validateVaultAddress(name, kind, p); err != nil {
+			return err
+		}
+		if err := validateMountName(name, "kv_mount", p.KVMount, defaultKVMount); err != nil {
+			return err
+		}
+		if strings.TrimSpace(p.K8sRole) != "" {
+			if err := validateMountName(name, "k8s_mount", p.K8sMount, defaultK8sMount); err != nil {
+				return err
+			}
 		}
 		hasToken := strings.TrimSpace(p.Token) != "" || strings.TrimSpace(p.TokenPath) != ""
 		hasK8s := strings.TrimSpace(p.K8sRole) != ""
@@ -134,6 +151,45 @@ func validateProvider(name string, p ProviderConfig) error {
 		}
 	}
 	return nil
+}
+
+func validateVaultAddress(name, kind string, p ProviderConfig) error {
+	raw := strings.TrimSpace(p.Address)
+	if raw == "" {
+		return fmt.Errorf("provider %q: address is required for kind %s", name, kind)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("provider %q: address must be an absolute URL (https://host:8200), got %q", name, p.Address)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("provider %q: address must be origin only (scheme://host[:port]), not a Vault API path", name)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && p.AllowInsecureHTTP != nil && *p.AllowInsecureHTTP {
+		return nil
+	}
+	return fmt.Errorf("provider %q: address must be https:// unless allow_insecure_http is true (lab / httptest)", name)
+}
+
+func validateMountName(provider, field, value, fallback string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		v = fallback
+	}
+	if !mountNameRe.MatchString(v) {
+		return fmt.Errorf("provider %q: %s must match [A-Za-z0-9_-]+ (Vault CLI mount name), got %q", provider, field, value)
+	}
+	return nil
+}
+
+func validateSecretsConfigValue(cfg *SecretsConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("secrets config is nil")
+	}
+	return cfg.validate()
 }
 
 func (c SecretsConfig) validate() error {

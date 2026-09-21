@@ -142,12 +142,51 @@ You only list the providers this process uses. An unused kind is omitted.
 
 | Kind | `Get` Path | `Get` Key | Auth in v1 |
 |---|---|---|---|
-| `openbao` / `vault` | KV path under `kv_mount` | property in the KV data map | `token` / `token_path`, or `k8s_role` (+ JWT file) |
+| `openbao` / `vault` | CLI-style KV path under `kv_mount` (not `data/…`) | property in the KV data map | `token` / `token_path`, or `k8s_role` (+ JWT file) |
 | `aws` | Secrets Manager name or ARN | JSON object key if the secret string is JSON | AWS default credential chain (`region` required) |
 | `gcp` | secret id, or full `projects/…/secrets/…` | JSON object key if payload is JSON | Application Default Credentials (`project` required) |
 | `file` | path under `root` | JSON object key if the file is JSON | local / tests only |
 
 `kind: file` is for laptop tests. It is not a production secret store.
+
+### Vault/OpenBao KV path: CLI-style, driver inserts `/data/`
+
+This module speaks **KV v2 only**. The HTTP API is
+`GET /v1/<kv_mount>/data/<path>`. The Vault/OpenBao CLI hides that prefix:
+`vault kv get secret/app/db` is the same secret as
+`Ref{Path: "app/db"}` with `kv_mount: "secret"`.
+
+Do **not** put `data/` in `Ref.Path`. The driver adds it. If you copy the
+HTTP path (`data/app/db`), the request becomes
+`/v1/secret/data/data/app/db` — a different (usually missing) secret, the
+same footgun as `vault kv get secret/data/app/db`.
+
+Do **not** omit `/data/` in the HTTP URL to “match the CLI.” Omitting it is
+KV v1. This chassis does not speak KV v1.
+
+```text
+Wrong: Ref{Path: "data/app/db"} because you saw /v1/secret/data/ in the API docs.
+Right: Ref{Path: "app/db"} — same string you pass after the mount to `vault kv get`.
+
+Wrong: expect the driver to call /v1/secret/app/db (KV v1).
+Right: KV v2 URL is always /v1/<kv_mount>/data/<path>.
+```
+
+`..`, empty segments, and backslashes in `Ref.Path` are rejected so the
+process token cannot walk off `/v1/<mount>/data/`. `kv_mount` and
+`k8s_mount` are `[A-Za-z0-9_-]+` (the CLI mount name, not a URL path).
+
+### Address TLS (Vault/OpenBao)
+
+**Path A (required):** `address` is `https://host:8200` (origin only — no
+`/v1/...` path). Tokens stay on TLS.
+
+**Path B (lab):** `allow_insecure_http: true` for `http://` (httptest /
+laptop). Error log + `cf_secrets_allow_insecure_http`. Not production.
+
+`tls_insecure_skip_verify` is a different lab switch (HTTPS, but do not
+verify the cert). Error log + `cf_secrets_tls_insecure_skip_verify`. Never
+production. It does **not** allow `http://`.
 
 ### Auth paths for Vault/OpenBao (pick one per provider)
 
@@ -160,6 +199,23 @@ JWT (`k8s_jwt_path`, default the in-cluster token path) to
 
 **Path Inline token (dev / break-glass):** `token` in the config file. Do not
 use this in production files that are not a Secret.
+
+### Trusted config (ops / Pod spec only)
+
+These fields are opened as the process uid. There is no extra jail. Treat
+them like configuration `Path`: only values that already come from the
+chart, External Secrets mount, or laptop file.
+
+| Field | Kind | What the process does |
+|---|---|---|
+| `address` | vault / openbao | HTTP client talks to that origin |
+| `token_path` / `k8s_jwt_path` / `tls_ca_file` | vault / openbao | `os.ReadFile` |
+| `endpoint` | aws | SDK endpoint override (LocalStack / tests) |
+| `credentials_file` | gcp | Google ADC JSON path |
+| `root` | file | directory jail for `Ref.Path` (this one *is* jailed) |
+
+Wrong: pass a user-controlled AWS `endpoint` or GCP `credentials_file` from
+a request. Right: chart/file only.
 
 ## Lifecycle
 
@@ -187,7 +243,8 @@ flowchart TD
 ## Health and metrics
 
 `Health` re-pings every provider. Metrics (`cf_secrets_*`) include provider
-count, Get totals, ping failures, DegradedMode.
+count, Get totals, ping failures, DegradedMode, and lab TLS/HTTP screams
+(`cf_secrets_tls_insecure_skip_verify`, `cf_secrets_allow_insecure_http`).
 
 ## License
 

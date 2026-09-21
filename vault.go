@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -29,9 +29,10 @@ type vaultDriver struct {
 	token     string
 	auth      vaultAuth
 	http      *http.Client
+	log       *slog.Logger
 }
 
-func newVaultDriver(kind string, p ProviderConfig) (*vaultDriver, error) {
+func newVaultDriver(kind string, p ProviderConfig, log *slog.Logger) (*vaultDriver, error) {
 	timeout := time.Duration(timeoutOrDefault(p.TimeoutSec) * float64(time.Second))
 	tlsCfg, err := vaultTLS(p)
 	if err != nil {
@@ -47,6 +48,7 @@ func newVaultDriver(kind string, p ProviderConfig) (*vaultDriver, error) {
 		namespace: strings.TrimSpace(p.Namespace),
 		mount:     strings.TrimSpace(p.KVMount),
 		http:      &http.Client{Timeout: timeout, Transport: tr},
+		log:       log,
 	}
 	if d.mount == "" {
 		d.mount = defaultKVMount
@@ -133,7 +135,11 @@ func (d *vaultDriver) k8sLogin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.address+"/v1/auth/"+d.auth.mount+"/login", bytes.NewReader(body))
+	loginURL, err := vaultJoin(d.address, "v1", "auth", d.auth.mount, "login")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -146,7 +152,8 @@ func (d *vaultDriver) k8sLogin(ctx context.Context) error {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("k8s login: %s: %s", resp.Status, bytes.TrimSpace(raw))
+		d.logHTTPErrorBody("k8s login", resp.StatusCode, raw)
+		return vaultHTTPStatusError("k8s login", resp.StatusCode)
 	}
 	var out struct {
 		Auth struct {
@@ -177,7 +184,11 @@ func (d *vaultDriver) ping(ctx context.Context) error {
 	if err := d.ensureToken(ctx); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.address+"/v1/sys/health", nil)
+	healthURL, err := vaultJoin(d.address, "v1", "sys", "health")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
 		return err
 	}
@@ -199,12 +210,9 @@ func (d *vaultDriver) get(ctx context.Context, ref Ref) ([]byte, error) {
 	if err := d.ensureToken(ctx); err != nil {
 		return nil, err
 	}
-	path := strings.Trim(ref.Path, "/")
-	u := d.address + "/v1/" + d.mount + "/data/" + path
-	if v := strings.TrimSpace(ref.Version); v != "" {
-		if _, err := strconv.Atoi(v); err == nil {
-			u += "?version=" + v
-		}
+	u, err := kvReadURL(d.address, d.mount, ref.Path, ref.Version)
+	if err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -225,7 +233,8 @@ func (d *vaultDriver) get(ctx context.Context, ref Ref) ([]byte, error) {
 		return nil, fmt.Errorf("secret %q not found", ref.Path)
 	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("read %s: %s: %s", path, resp.Status, bytes.TrimSpace(raw))
+		d.logHTTPErrorBody("kv read", resp.StatusCode, raw)
+		return nil, vaultHTTPStatusError("kv read", resp.StatusCode)
 	}
 	var wrap struct {
 		Data struct {
@@ -253,4 +262,26 @@ func (d *vaultDriver) get(ctx context.Context, ref Ref) ([]byte, error) {
 	default:
 		return json.Marshal(t)
 	}
+}
+
+func vaultHTTPStatusError(op string, status int) error {
+	text := http.StatusText(status)
+	if text == "" {
+		return fmt.Errorf("%s: HTTP %d", op, status)
+	}
+	return fmt.Errorf("%s: %d %s", op, status, text)
+}
+
+func (d *vaultDriver) logHTTPErrorBody(op string, status int, raw []byte) {
+	if d.log == nil {
+		return
+	}
+	// Bodies can echo request/secret material. Public errors are status only;
+	// Debug logs length, not the bytes.
+	d.log.Debug("cf_secrets: vault/openbao HTTP error",
+		"kind", d.kindName,
+		"op", op,
+		"status", status,
+		"body_len", len(raw),
+	)
 }

@@ -139,6 +139,8 @@ type CFSecrets struct {
 	pingFailures atomic.Int64
 	degradedUses atomic.Int64
 	unhealthy    atomic.Bool
+	tlsInsecure  atomic.Int64
+	insecureHTTP atomic.Int64
 }
 
 // New constructs the component. Providers are opened at Init.
@@ -249,7 +251,7 @@ func (c *CFSecrets) rebuildDriversLocked(ctx context.Context) error {
 	next := make(map[string]driver, len(c.cfg.Providers))
 	var pingErrs []string
 	for name, p := range c.cfg.Providers {
-		d, err := buildDriver(ctx, p)
+		d, err := buildDriver(ctx, p, c.logger)
 		if err != nil {
 			closeDrivers(next)
 			return fmt.Errorf("cf_secrets: provider %q: %w", name, err)
@@ -277,17 +279,43 @@ func (c *CFSecrets) rebuildDriversLocked(ctx context.Context) error {
 	c.drivers = next
 	closeDrivers(old)
 	c.unhealthy.Store(len(pingErrs) > 0)
+	c.screamInsecureLocked()
 	return nil
 }
 
-func buildDriver(ctx context.Context, p ProviderConfig) (driver, error) {
+func (c *CFSecrets) screamInsecureLocked() {
+	var skip, clearHTTP int64
+	for name, p := range c.cfg.Providers {
+		kind, err := normalizeKind(p.Kind)
+		if err != nil {
+			continue
+		}
+		if kind != kindVault && kind != kindOpenBao {
+			continue
+		}
+		if p.TLSInsecureSkipVerify != nil && *p.TLSInsecureSkipVerify {
+			skip++
+			c.logger.Error("cf_secrets: tls_insecure_skip_verify is on — server cert is not verified; tokens and secret bytes are MITM-able. Lab only.",
+				"provider", name, "kind", kind)
+		}
+		if p.AllowInsecureHTTP != nil && *p.AllowInsecureHTTP {
+			clearHTTP++
+			c.logger.Error("cf_secrets: allow_insecure_http is on — tokens travel in cleartext. Lab / httptest only.",
+				"provider", name, "kind", kind)
+		}
+	}
+	c.tlsInsecure.Store(skip)
+	c.insecureHTTP.Store(clearHTTP)
+}
+
+func buildDriver(ctx context.Context, p ProviderConfig, log *slog.Logger) (driver, error) {
 	kind, err := normalizeKind(p.Kind)
 	if err != nil {
 		return nil, err
 	}
 	switch kind {
 	case kindVault, kindOpenBao:
-		return newVaultDriver(kind, p)
+		return newVaultDriver(kind, p, log)
 	case kindAWS:
 		return newAWSDriver(ctx, p)
 	case kindGCP:
@@ -413,6 +441,7 @@ func (c *CFSecrets) RegisterConfigSources(conf any) error {
 		Format:    format,
 		Owner:     c.Name(),
 		EnvPrefix: c.srcEnvPrefix,
+		Validate:  validateSecretsConfigValue,
 	})
 }
 
@@ -491,6 +520,8 @@ func (c *CFSecrets) Metrics() []cf_observability.Metric {
 		{Name: "cf_secrets_get_errors_total", Help: "Failed Get calls.", Value: float64(c.getErrors.Load()), Labels: labels, Type: cf_observability.MetricTypeCounter},
 		{Name: "cf_secrets_ping_failures_total", Help: "Provider ping failures.", Value: float64(c.pingFailures.Load()), Labels: labels, Type: cf_observability.MetricTypeCounter},
 		{Name: "cf_secrets_degraded_init_total", Help: "DegradedMode ping failures at Init/reload.", Value: float64(c.degradedUses.Load()), Labels: labels, Type: cf_observability.MetricTypeCounter},
+		{Name: "cf_secrets_tls_insecure_skip_verify", Help: "Count of vault/openbao providers with tls_insecure_skip_verify (lab; MITM-able).", Value: float64(c.tlsInsecure.Load()), Labels: labels},
+		{Name: "cf_secrets_allow_insecure_http", Help: "Count of vault/openbao providers with allow_insecure_http (lab; tokens in cleartext).", Value: float64(c.insecureHTTP.Load()), Labels: labels},
 	}
 }
 
