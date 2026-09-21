@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 )
 
 func TestValidateProvider(t *testing.T) {
@@ -100,7 +102,7 @@ func TestVaultDriverKV(t *testing.T) {
 		Address: srv.URL,
 		KVMount: "secret",
 		Token:   "s.test",
-	})
+	}, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +114,165 @@ func TestVaultDriverKV(t *testing.T) {
 	if err != nil || string(got) != "hexsecret" {
 		t.Fatalf("got %q err %v", got, err)
 	}
+}
+
+func TestSanitizeKVSecretPath(t *testing.T) {
+	ok, err := sanitizeKVSecretPath("caerus-framework/release-train-gh-app")
+	if err != nil || ok != "caerus-framework/release-train-gh-app" {
+		t.Fatalf("got %q err %v", ok, err)
+	}
+	for _, raw := range []string{
+		"../sys/raw",
+		"foo/../bar",
+		"foo/./bar",
+		"foo//bar",
+		`foo\bar`,
+		"data/caerus-framework/release-train-gh-app",
+		"data",
+		"",
+	} {
+		if _, err := sanitizeKVSecretPath(raw); err == nil {
+			t.Fatalf("expected reject for %q", raw)
+		}
+	}
+	u, err := kvReadURL("https://vault.example:8200", "secret", "app/db", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "https://vault.example:8200/v1/secret/data/app/db" {
+		t.Fatalf("url = %q", u)
+	}
+}
+
+func TestVaultGetRejectsTraversal(t *testing.T) {
+	d, err := newVaultDriver(kindVault, ProviderConfig{
+		Address: "https://vault.example:8200",
+		Token:   "s.test",
+	}, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.get(context.Background(), Ref{Path: "../sys/policy"}); err == nil {
+		t.Fatal("expected path reject")
+	}
+	if _, err := d.get(context.Background(), Ref{Path: "data/app/db"}); err == nil {
+		t.Fatal("expected data/ prefix reject")
+	}
+}
+
+func TestVaultErrorBodyNotInPublicError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sys/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/v1/secret/data/app/db", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":["permission denied: leaked-fixture-secret"]}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	d, err := newVaultDriver(kindOpenBao, ProviderConfig{
+		Address: srv.URL,
+		Token:   "s.test",
+	}, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.get(context.Background(), Ref{Path: "app/db"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "leaked-fixture-secret") {
+		t.Fatalf("public error leaked body: %v", err)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("want status in error, got %v", err)
+	}
+}
+
+func TestValidateRequiresHTTPS(t *testing.T) {
+	p := ProviderConfig{Kind: "vault", Address: "http://vault.example:8200", Token: "s.x"}
+	if err := validateProvider("v", p); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("http without allow_insecure_http: %v", err)
+	}
+	p.AllowInsecureHTTP = boolPtr(true)
+	if err := validateProvider("v", p); err != nil {
+		t.Fatal(err)
+	}
+	p.Address = "https://vault.example:8200"
+	p.AllowInsecureHTTP = nil
+	if err := validateProvider("v", p); err != nil {
+		t.Fatal(err)
+	}
+	p.Address = "https://vault.example:8200/v1"
+	if err := validateProvider("v", p); err == nil {
+		t.Fatal("address with API path should fail")
+	}
+}
+
+func TestValidateMountCharset(t *testing.T) {
+	p := ProviderConfig{Kind: "vault", Address: "https://vault.example:8200", Token: "s.x", KVMount: "secret/../sys"}
+	if err := validateProvider("v", p); err == nil || !strings.Contains(err.Error(), "kv_mount") {
+		t.Fatalf("bad kv_mount: %v", err)
+	}
+	p.KVMount = "secret"
+	p.K8sRole = "app"
+	p.K8sMount = "k8s/../auth"
+	if err := validateProvider("v", p); err == nil || !strings.Contains(err.Error(), "k8s_mount") {
+		t.Fatalf("bad k8s_mount: %v", err)
+	}
+}
+
+func TestInsecureTLSScreams(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sys/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+	c := New(WithConfig(SecretsConfig{
+		Providers: map[string]ProviderConfig{
+			"bao": {
+				Kind:                  "openbao",
+				Address:               srv.URL,
+				Token:                 "s.test",
+				AllowInsecureHTTP:     boolPtr(true),
+				TLSInsecureSkipVerify: boolPtr(true),
+			},
+		},
+	}), WithLogger(log))
+	if err := c.Init(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Shutdown(context.Background()) })
+	out := buf.String()
+	if !strings.Contains(out, "tls_insecure_skip_verify is on") {
+		t.Fatalf("expected skip-verify scream, got:\n%s", out)
+	}
+	if !strings.Contains(out, "allow_insecure_http is on") {
+		t.Fatalf("expected http scream, got:\n%s", out)
+	}
+	if got := metricNamed(t, c.Metrics(), "cf_secrets_tls_insecure_skip_verify"); got != 1 {
+		t.Fatalf("skip-verify gauge = %v, want 1", got)
+	}
+	if got := metricNamed(t, c.Metrics(), "cf_secrets_allow_insecure_http"); got != 1 {
+		t.Fatalf("insecure http gauge = %v, want 1", got)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func metricNamed(t *testing.T, ms []cf_observability.Metric, name string) float64 {
+	t.Helper()
+	for _, m := range ms {
+		if m.Name == name {
+			return m.Value
+		}
+	}
+	t.Fatalf("metric %s missing in %+v", name, ms)
+	return 0
 }
 
 func TestCFSecretsFileProvider(t *testing.T) {
